@@ -8,7 +8,7 @@ Error.stackTraceLimit = 20;
 // Include external modules
 var http = require("http");
 const moment = require('moment');
-const host = require("os"); 
+const host = require("os");
 const util = require('util')
 const path = require('path');
 const Fixer = require('fixer-node')
@@ -25,6 +25,8 @@ var self = this;
 var stateObject = function () {
     this.data = {
         ratelist: null,
+        unreliable: null,
+        last_error: null,
     }
     this.db = {
             connected: false,
@@ -102,31 +104,49 @@ fnUpdateTimestamp = async function(state, timestamp, mysql) {
 //
 fnGetFixerRates = async function(state, fixer, mysql) {
 
-    // [TODO] There should be an if condition here regarding multiple node updates
-
-    // [TODO] and a try statement! .. shame on me :-(
-
     if ((typeof(state.db.configured) === 'undefined') || (state.db.configured === false)) { return; }
 
     fnUpdateTimestamp(state, 'last_fixer_get', mysql)
 
-    // get rates
-    const base = await fixer.base({ base: 'EUR' }) // Optional: symbols: 'USD, GBP, ETC'
+    try {
+        // get rates
+        const base = await fixer.base({ base: 'EUR' }) // Optional: symbols: 'USD, GBP, ETC'
 
-    // console.log("> Ermagherd, got some rates!");
-    fnUpdateTimestamp(state, 'last_fixer_recv', mysql)
+        // console.log("> Ermagherd, got some rates!");
+        fnUpdateTimestamp(state, 'last_fixer_recv', mysql)
 
-    // Just grasp the rates only
-    const obj = JSON.parse(JSON.stringify(base.rates))
-    Object.entries(obj).map(([key, value]) => {
+        state.data.unreliable = false;
 
-        // store in the db
-        var strSQL = "INSERT INTO tbl_rates_eur (curr, rate) VALUES ('"+key+"', '"+value+"') ON DUPLICATE KEY UPDATE curr = VALUES(curr), rate = VALUES(rate)"
-        mysql.dbQuery(strSQL, state, function(err,results){
-            if (err) { console.error("[ERROR] from dbQuery: ",err); }
+        // Just grasp the rates only
+        const obj = JSON.parse(JSON.stringify(base.rates))
+        Object.entries(obj).map(([key, value]) => {
+
+            // store in the db
+            var strSQL = "INSERT INTO tbl_rates_eur (curr, rate) VALUES ('"+key+"', '"+value+"') ON DUPLICATE KEY UPDATE curr = VALUES(curr), rate = VALUES(rate)"
+            mysql.dbQuery(strSQL, state, function(err,results){
+                if (err) { console.error("[ERROR] from dbQuery: ",err); }
+            });
         });
-    });
-    fnUpdateTimestamp(state, 'last_local_recv', mysql)
+
+        fnUpdateTimestamp(state, 'last_local_recv', mysql)
+
+    } catch (err) {
+        // err.info is the same as err.message,
+        // e.g. "Your monthly API request volume has been reached. Please upgrade your plan"
+        const info = err.info
+
+        // err.code the fixer.io API code,
+        // e.g. "201" which represents "An invalid base currency has been entered."
+        const code = err.code
+
+        var tmpError;
+        tmpError = "[err.code:"+err.code+"] [err.info:"+err.info+"]";
+        if (err.code === 101) { tmpError = "Your monthly usage limit has been reached.\n         Please upgrade your Subscription Plan." }
+
+        state.data.last_error = tmpError;
+        state.data.unreliable = true;
+    }
+
 }
 
 // --------------------------------------------------
@@ -154,7 +174,7 @@ fnLoadLocalData = function(state, mysql) {
             fnUpdateTimestamp(state, 'last_local_recv', mysql)
         }
         return; // inner query
-    });    
+    });
     return; // outer fn
 }
 
@@ -170,12 +190,23 @@ var fnLaunchServer = function(state) {
         });
 
         // caller to load the dataset into state
-        // 
+        //
         var showTheMoney = fnLoadLocalData(state, mysql, function(err,rates){ });
 
         // check that our data is valid (It isn't on the first run) and print it
         //
         if (!(typeof(state.data.ratelist) === 'undefined') && !(state.data.ratelist === null) ) {
+
+            if (!(typeof(state.data.unreliable) === 'undefined') && (state.data.unreliable === true) ) {
+                // something is awry with the data, add a warning at the start
+                this.tmpWarning = ""
+                response.write("--[ WARNING ]--------------------------------------- \n\n");
+                response.write("WARNING: This data may be out of date.\n\n");
+                response.write("Reason:  " + state.data.last_error.toString() + " \n");
+                response.write("\n");
+            }
+
+            // print our most recently fetched rates
             response.write(state.data.ratelist.toString()+"\n\n");
         } else {
             response.write("No data currently available, please wait a moment ..." + "\n\n");
@@ -185,12 +216,13 @@ var fnLaunchServer = function(state) {
         //
         response.write("\n");
         response.write("--[ timestamps ]------------------------------------ \n");
-        response.write("fixer data last fetched:   (UTC) " + moment.utc(state.timestamps.last_fixer_get).format('HH:mm:ss DD/MM/YYYY') + "\n");
+        response.write("fixer data last received:  (UTC) " + moment.utc(state.timestamps.last_fixer_recv).format('HH:mm:ss DD/MM/YYYY') + "\n");
         response.write("loaded from local DB:      (UTC) " + moment.utc(state.timestamps.last_local_get).format('HH:mm:ss DD/MM/YYYY') + "\n");
 
         // coded but not used in the final output:
         //
         // ("Page executed at:          (UTC) " + moment().utc().format('HH:mm:ss DD/MM/YYYY') + "\n");
+        // ("fixer data last fetched:   (UTC) " + moment.utc(state.timestamps.last_fixer_get) + "\n");
         // ("fixer data received at:    (UTC) " + moment.utc(state.timestamps.last_fixer_recv) + "\n");
         // ("written to local DB at:    (UTC) " + moment.utc(state.timestamps.last_local_recv) + "\n");
 
@@ -216,7 +248,7 @@ var fnDoItDoItNow = function() {
 
     // get a fixer instance
     const fixer = new Fixer('###STRINGREPLACEAPIKEY###');
-
+    
     // connect the db
     fnConnectDatabase(state, mysql);
 
@@ -244,4 +276,3 @@ var fnDoItDoItNow = function() {
 
 }
 fnDoItDoItNow()
-
